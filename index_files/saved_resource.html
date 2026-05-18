@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="tr"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Murvet'in Doğum Günü Hediyesi</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&amp;family=DM+Mono:wght@300;400;500&amp;display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --cream: #f5f0e8;
+    --ink: #1a1714;
+    --warm-gray: #8c7f72;
+    --accent: #c4714a;
+    --light-border: #ddd5c8;
+    --paper: #faf7f2;
+  }
+  body {
+    background: var(--cream);
+    color: var(--ink);
+    font-family: 'DM Mono', monospace;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem 1rem;
+  }
+  .card {
+    background: var(--paper);
+    border: 1px solid var(--light-border);
+    max-width: 480px;
+    width: 100%;
+    padding: 3rem 2.5rem;
+    position: relative;
+    box-shadow: 4px 4px 0px var(--light-border);
+  }
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: var(--accent);
+  }
+  .label {
+    font-size: 0.65rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--warm-gray);
+    margin-bottom: 0.5rem;
+  }
+  h1 {
+    font-family: 'Playfair Display', serif;
+    font-size: 2rem;
+    line-height: 1.15;
+    margin-bottom: 0.25rem;
+  }
+  h1 em { font-style: italic; color: var(--accent); }
+  .subtitle {
+    font-size: 0.72rem;
+    color: var(--warm-gray);
+    line-height: 1.6;
+    margin-top: 1rem;
+    margin-bottom: 2rem;
+    border-top: 1px solid var(--light-border);
+    padding-top: 1rem;
+  }
+  .device-image {
+    width: 100%;
+    margin-bottom: 2rem;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .device-image img { width: 100%; display: block; border-radius: 4px; }
+  .progress-section { margin-bottom: 2rem; }
+  .amounts-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 0.6rem;
+  }
+  .raised { font-family: 'Playfair Display', serif; font-size: 1.6rem; font-weight: 700; }
+  .goal { font-size: 0.72rem; color: var(--warm-gray); }
+  .track { height: 8px; background: var(--light-border); overflow: hidden; margin-bottom: 0.5rem; }
+  .fill { height: 100%; background: var(--accent); transition: width 0.8s cubic-bezier(0.4,0,0.2,1); width: 0%; }
+  .pct-label { font-size: 0.65rem; color: var(--warm-gray); letter-spacing: 0.1em; }
+  .zelle-box {
+    background: var(--cream);
+    border: 1px solid var(--light-border);
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+  }
+  .zelle-row { display: flex; align-items: center; justify-content: space-between; margin-top: 0.5rem; }
+  .zelle-number { font-size: 0.85rem; color: var(--ink); }
+  .contribute-box {
+    background: var(--cream);
+    border: 1px solid var(--light-border);
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .contribute-box .label { margin-bottom: 1rem; }
+  .amount-input-row { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+  .currency { font-family: 'Playfair Display', serif; font-size: 1.2rem; line-height: 2.4rem; color: var(--warm-gray); }
+  input[type="number"] {
+    flex: 1;
+    font-family: 'DM Mono', monospace;
+    font-size: 1.2rem;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid var(--ink);
+    padding: 0.3rem 0;
+    outline: none;
+    color: var(--ink);
+    width: 100%;
+  }
+  input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }
+  input[type="text"] {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.8rem;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--light-border);
+    padding: 0.3rem 0;
+    outline: none;
+    color: var(--ink);
+    width: 100%;
+    margin-bottom: 1rem;
+  }
+  input[type="text"]::placeholder, input[type="number"]::placeholder { color: var(--light-border); }
+  .quick-amounts { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .quick-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.65rem;
+    padding: 0.3rem 0.7rem;
+    border: 1px solid var(--light-border);
+    background: transparent;
+    cursor: pointer;
+    color: var(--warm-gray);
+    transition: all 0.15s;
+    letter-spacing: 0.05em;
+  }
+  .quick-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .add-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    background: var(--ink);
+    color: var(--paper);
+    border: none;
+    padding: 0.75rem 1.5rem;
+    cursor: pointer;
+    width: 100%;
+    transition: background 0.15s;
+  }
+  .add-btn:hover { background: var(--accent); }
+  .copy-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.62rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    background: transparent;
+    border: 1px solid var(--light-border);
+    color: var(--warm-gray);
+    padding: 0.3rem 0.7rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .zelle-note { font-size: 0.62rem; color: var(--warm-gray); margin-top: 0.5rem; }
+  .contributors { border-top: 1px solid var(--light-border); padding-top: 1.5rem; }
+  .contributors .label { margin-bottom: 1rem; }
+  .contrib-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 0;
+    border-bottom: 1px dashed var(--light-border);
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
+  .contrib-name { font-size: 0.75rem; color: var(--ink); }
+  .contrib-amount { font-family: 'Playfair Display', serif; font-size: 0.9rem; color: var(--accent); }
+  .delete-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--light-border);
+    font-size: 0.85rem;
+    padding: 0.1rem 0.3rem;
+    transition: color 0.15s;
+  }
+  .delete-btn:hover { color: var(--accent); }
+  .empty-state { font-size: 0.7rem; color: var(--warm-gray); font-style: italic; text-align: center; padding: 1rem 0; }
+  .toast {
+    position: fixed;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%) translateY(4px);
+    background: var(--ink);
+    color: var(--paper);
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    padding: 0.6rem 1.5rem;
+    opacity: 0;
+    transition: all 0.3s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .loading { font-size: 0.7rem; color: var(--warm-gray); text-align: center; padding: 1rem 0; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div class="card">
+  <p class="label">doğum günü hediye listesi</p>
+  <h1>Murvet'in<br><em>reMarkable</em>'ı</h1>
+  <p class="subtitle">
+    Sevgili dostlarım, 49. yaş günüm için kendime dijital defter hediye ediyorum. Sizde hediyemin bir parçası olabilirsiniz. Şimdiden teşekkürler ❤️
+  </p>
+  <div class="device-image">
+    <img src="https://remarkable.com/store/remarkable-2/assets/images/remarkable-2-bundle.png" alt="reMarkable" onerror="this.style.display=&#39;none&#39;" style="display: none;">
+  </div>
+  <div class="progress-section">
+    <div class="amounts-row">
+      <span class="raised" id="raised-display">$0</span>
+      <span class="goal">hedef: $750</span>
+    </div>
+    <div class="track"><div class="fill" id="progress-fill"></div></div>
+    <span class="pct-label" id="pct-label">%0 tamamlandı</span>
+  </div>
+  <div class="zelle-box">
+    <p class="label">zelle ile gönder</p>
+    <div class="zelle-row">
+      <span class="zelle-number">📱 (201) 355-6533</span>
+      <button class="copy-btn" onclick="copyZelle()" id="copy-btn">kopyala</button>
+    </div>
+    <p class="zelle-note">Gönderdikten sonra aşağıdan katkını kaydet!</p>
+  </div>
+  <div class="contribute-box">
+    <p class="label">katkını kaydet</p>
+    <div class="quick-amounts">
+      <button class="quick-btn" onclick="setAmount(50)">$50</button>
+      <button class="quick-btn" onclick="setAmount(75)">$75</button>
+      <button class="quick-btn" onclick="setAmount(100)">$100</button>
+      <button class="quick-btn" onclick="setAmount(150)">$150</button>
+    </div>
+    <div class="amount-input-row">
+      <span class="currency">$</span>
+      <input type="number" id="amount-input" placeholder="0" min="1" max="750">
+    </div>
+    <input type="text" id="name-input" placeholder="adın (isteğe bağlı)">
+    <button class="add-btn" onclick="addContribution()">Katkı Ekle</button>
+  </div>
+  <div class="contributors">
+    <p class="label">katkılar</p>
+    <div id="contrib-list"><p class="loading">Yükleniyor...</p></div>
+  </div>
+</div>
+<div class="toast" id="toast">Eklendi! Teşekkürler 🎉</div>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyACXofBI7uEm-f63oCKb4fI32jN3A9Ov7U",
+    authDomain: "murvet-e2f90.firebaseapp.com",
+    projectId: "murvet-e2f90",
+    storageBucket: "murvet-e2f90.firebasestorage.app",
+    messagingSenderId: "492952971749",
+    appId: "1:492952971749:web:d2fc3f83ef3b979cc1e70c"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+  const GOAL = 750;
+
+  // Listen for real-time updates
+  const q = query(collection(db, "contributions"), orderBy("date", "desc"));
+  onSnapshot(q, (snapshot) => {
+    const contributions = [];
+    snapshot.forEach(d => contributions.push({ id: d.id, ...d.data() }));
+    renderAll(contributions);
+  });
+
+  function renderAll(contributions) {
+    const total = contributions.reduce((s, c) => s + c.amount, 0);
+    const pct = Math.min((total / GOAL) * 100, 100);
+    document.getElementById('raised-display').textContent = '$' + total.toLocaleString();
+    document.getElementById('progress-fill').style.width = pct + '%';
+    document.getElementById('pct-label').textContent = '%' + Math.round(pct) + ' tamamlandı';
+    const list = document.getElementById('contrib-list');
+    if (contributions.length === 0) {
+      list.innerHTML = '<p class="empty-state">Henüz katkı yok — ilk sen ol! 🎁</p>';
+      return;
+    }
+    list.innerHTML = contributions.map(c => `
+      <div class="contrib-item">
+        <span class="contrib-name">${c.name || 'Anonim'}</span>
+        <span style="display:flex;align-items:center;gap:0.5rem;">
+          <span class="contrib-amount">$${c.amount}</span>
+          <button class="delete-btn" onclick="window.deleteContrib('${c.id}')" title="Sil">✕</button>
+        </span>
+      </div>
+    `).join('');
+  }
+
+  window.deleteContrib = async (id) => {
+    if (confirm('Bu katkıyı silmek istiyor musun?')) {
+      await deleteDoc(doc(db, "contributions", id));
+    }
+  };
+
+  window.addContribution = async () => {
+    const amountInput = document.getElementById('amount-input');
+    const nameInput = document.getElementById('name-input');
+    const amount = parseFloat(amountInput.value);
+    if (!amount || amount <= 0) { amountInput.focus(); return; }
+    await addDoc(collection(db, "contributions"), {
+      name: nameInput.value.trim() || null,
+      amount: Math.round(amount),
+      date: new Date().toISOString()
+    });
+    amountInput.value = '';
+    nameInput.value = '';
+    showToast();
+  };
+
+  window.setAmount = (val) => { document.getElementById('amount-input').value = val; };
+
+  window.copyZelle = () => {
+    navigator.clipboard.writeText('2013556533');
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = 'kopyalandı!';
+    btn.style.color = 'var(--accent)';
+    setTimeout(() => { btn.textContent = 'kopyala'; btn.style.color = ''; }, 2000);
+  };
+
+  function showToast() {
+    const t = document.getElementById('toast');
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 2500);
+  }
+
+  document.getElementById('name-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') window.addContribution();
+  });
+</script>
+
+
+</body></html>
