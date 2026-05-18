@@ -223,7 +223,7 @@
   <div class="progress-section">
     <div class="amounts-row">
       <span class="raised" id="raised-display">$0</span>
-      <span class="goal">hedef: $750</span>
+      <span class="goal">hedef: $1000</span>
     </div>
     <div class="track"><div class="fill" id="progress-fill"></div></div>
     <span class="pct-label" id="pct-label">%0 tamamlandı</span>
@@ -246,7 +246,7 @@
     </div>
     <div class="amount-input-row">
       <span class="currency">$</span>
-      <input type="number" id="amount-input" placeholder="0" min="1" max="750">
+      <input type="number" id="amount-input" placeholder="0" min="1" max="1000">
     </div>
     <input type="text" id="name-input" placeholder="adın (isteğe bağlı)">
     <button class="add-btn" onclick="addContribution()">Katkı Ekle</button>
@@ -273,7 +273,7 @@
 
   const app = initializeApp(firebaseConfig);
   const db = getFirestore(app);
-  const GOAL = 750;
+  const GOAL = 1000;
 
   // Listen for real-time updates
   const q = query(collection(db, "contributions"), orderBy("date", "desc"));
